@@ -1,0 +1,3 @@
+/home/atharv/Desktop/projects/audio_reactive_ascii_camera/build/CMakeFiles/ascii_cam.dir
+/home/atharv/Desktop/projects/audio_reactive_ascii_camera/build/CMakeFiles/edit_cache.dir
+/home/atharv/Desktop/projects/audio_reactive_ascii_camera/build/CMakeFiles/rebuild_cache.dir
