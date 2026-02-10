@@ -5,14 +5,15 @@ import sys
 import os
 
 # --- CONFIGURATION ---
-WIDTH = 100  # Width of the ASCII output in characters
+WIDTH = 200  # Width of the ASCII output in characters
 CHUNK = 1024 # Audio chunk size
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 44100 # Audio sampling rate
 
 # The Gradient: From dark pixels to light pixels
-ASCII_CHARS = [" ", ".", ":", "-", "=", "+", "*", "#", "%", "@"]
+# The "HD" Gradient: 70 levels of shading instead of 10
+ASCII_CHARS = list(" `.-':_,^=;><+!rc*/z?sLTv)J7(|Fi{C}fI31tlu[neoZ5Yxjya]2ESwqkP6h9d4VpOGbUAKXHm8RD#$Bg0MNWQ%&@")
 
 def get_audio_level(stream):
     """Reads a chunk of audio and calculates the RMS (volume) amplitude."""
@@ -38,18 +39,28 @@ def get_audio_level(stream):
 
 def pixel_to_ascii(image, intensity_shift=0):
     """Converts a grayscale image to a string of ASCII characters."""
-    # Normalize image to match the length of ASCII_CHARS
-    # We use integer division // to map 0-255 pixel values to 0-9 indices
     
-    # Audio Reactivity Logic: 
-    # We shift the pixel values based on volume (intensity_shift)
-    # This makes the image "explode" or brighten with sound
+    # --- FIX 1: UPGRADE THE CONTAINER ---
+    # Convert uint8 (0-255) to a standard int so it can hold large numbers
+    image = image.astype(int) 
+    
+    # --- FIX 2: ADD BRIGHTNESS AND CLIP ---
+    # Now we can safely add the loud audio volume
+    # Then we clip it back down to 0-255
     image = np.clip(image + intensity_shift, 0, 255)
     
-    indices = image // 25 # 255 / 10 chars approx 25
+    # --- FIX 3: SAFE INDEXING ---
+    # Map 0-255 strictly to the number of characters we have
+    n_chars = len(ASCII_CHARS)
+    indices = (image * (n_chars - 1)) // 255
     
-    # Use numpy lookup for speed (faster than looping)
+    # Ensure indices are integers for the lookup
+    indices = indices.astype(int)
+    
+    # Look up the ASCII characters
     ascii_arr = np.array(ASCII_CHARS)[indices]
+    
+    # Join them into a string
     return "\n".join("".join(row) for row in ascii_arr)
 
 def main():
