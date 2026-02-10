@@ -7,6 +7,8 @@ import time
 import math
 import random
 import colorsys
+import threading
+import shutil
 
 import mediapipe as mp
 from mediapipe.tasks import python
@@ -15,12 +17,30 @@ from mediapipe.tasks.python import vision
 # ═══════════════════════════════════════════════════════════════
 #  CONFIGURATION
 # ═══════════════════════════════════════════════════════════════
-WIDTH = 160           # Higher resolution for better detail
+WIDTH = 200           # Fallback width (used if AUTO_FULLSCREEN is False)
+AUTO_FULLSCREEN = True  # True = auto-fill terminal, False = use WIDTH above
 CAMERA_SOURCE = 0     # 0 = default webcam, 1 = external/phone, or "http://IP:PORT/video"
+AUDIO_SOURCE = "mic" # "mic" = microphone, "system" = PC audio (music), "both" = mix of both
 CHUNK = 1024          # Audio chunk size
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 44100
+
+# ── EFFECT BLEND RATIOS (tune these!) ──
+# Each pair: (effect_amount, camera_amount) — they should sum to 1.0
+BG_EFFECT_BLEND = 1.0    # Background: 90% sci-fi effects, 10% real camera
+BG_CAMERA_BLEND = 0.0
+BODY_EFFECT_BLEND = 0.2   # Body: 30% neon effects, 70% real camera
+BODY_CAMERA_BLEND = 0.8
+FACE_EFFECT_BLEND = 0.350  # Face: 10% tint, 90% real camera (keep face natural)
+FACE_CAMERA_BLEND = 0.75
+FACE_BRIGHTNESS_BOOST = 1.5 # Brightness multiplier for face clarity
+BODY_BRIGHTNESS_BOOST = 2.3  # Brightness multiplier for body clarity
+AUDIO_REACT_BODY = 0.1       # How much music affects body (0.0 = none, 1.0 = full)
+AUDIO_REACT_FACE = 0.1       # How much music affects face (0.0 = none, 1.0 = full)
+BG_INTENSITY = 1.0           # Background effects brightness (0.0 = dark, 1.0 = full bright)
+MUSIC_DISTORTION_STRENGTH = 1.0  # How strong the psychedelic music distortion is
+MUSIC_BG_FLOW_STRENGTH = 2.0     # How much music drives flowing neon background patterns
 
 # ASCII gradients
 # Standard high-density ASCII ramp (sorted by visual brightness)
@@ -67,8 +87,8 @@ FACE_COLORS = [
     (255, 255, 100),  # Bright yellow
 ]
 
-# Background sci-fi palette
-BG_BASE_COLOR = (10, 5, 20)       # Deep dark purple/black
+# Background sci-fi palette — Cyberpunk Cyan/Blue
+BG_BASE_COLOR = (0, 40, 60)  # Deep cyberpunk dark cyan/teal
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -107,100 +127,279 @@ def get_audio_level(stream):
         return 0
 
 
+class AudioCapture:
+    """Threaded audio capture to prevent blocking the render loop."""
+    def __init__(self, streams):
+        self.streams = streams
+        self.volume = 0.0
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+    
+    def _loop(self):
+        while self._running:
+            levels = []
+            for s in self.streams:
+                levels.append(get_audio_level(s))
+            self.volume = max(levels) if levels else 0.0
+    
+    def get_volume(self):
+        return self.volume
+    
+    def stop(self):
+        self._running = False
+        self._thread.join(timeout=1.0)
+
+
+def find_monitor_device(p):
+    """Find PulseAudio/PipeWire monitor source for capturing system audio."""
+    monitor_idx = None
+    monitor_name = ""
+    for i in range(p.get_device_count()):
+        try:
+            info = p.get_device_info_by_index(i)
+            name = info.get('name', '')
+            # Monitor sources contain 'monitor' in their name
+            if 'monitor' in name.lower() and info.get('maxInputChannels', 0) > 0:
+                monitor_idx = i
+                monitor_name = name
+                break
+        except Exception:
+            continue
+    return monitor_idx, monitor_name
+
+
 # ═══════════════════════════════════════════════════════════════
-#  SCI-FI BACKGROUND EFFECTS ENGINE
+#  TRIPPY BACKGROUND EFFECTS ENGINE
 # ═══════════════════════════════════════════════════════════════
 
+TRIPPY_CHARS = list('░▒▓█╬╠╣╦╩┼┤├┬┴│─┌┐└┘◆◇○●∞≈≡±×÷∆∇∂∫Σπφψω')
+GLITCH_CHARS = list('!@#$%^&*<>{}[]|/\\~`?=+')
+CYBER_WORDS = ['CYBER', 'HACK', 'NEURAL', 'SYNC', 'VOID', 'FLUX', 'GLITCH', 'NEON',
+               'DATA', 'CODE', 'PULSE', 'WAVE', 'NODE', 'GRID', 'LINK', 'CORE',
+               'ZERO', 'ROOT', 'SYS', 'NET', 'BIT', 'HEX', 'BOOT', 'INIT']
+
 class SciFiBackground:
-    """Manages animated sci-fi background effects: Matrix rain, ripples, pulses."""
+    """Chaotic cyber background: plasma, glitch, text trails, scan lines, sparks."""
 
     def __init__(self, width, height):
         self.w = width
         self.h = height
         self.frame_count = 0
+        self.audio_norm = 0
         
-        # Matrix rain
+        # Matrix rain - aggressive
         self.rain_cols = []
         for x in range(width):
             self.rain_cols.append({
                 'y': random.randint(-height, height),
-                'speed': random.randint(1, 3),
-                'len': random.randint(5, 15),
-                'active': random.random() < 0.2
+                'speed': random.randint(1, 5),
+                'len': random.randint(3, 12),
+                'active': random.random() < 0.35,
+                'hue': random.random()
             })
-            
-        # Holographic ripples (x, y, radius, max_radius)
-        self.ripples = []
+        
+        # Glitch blocks
+        self.glitch_blocks = []
+        
+        # Sparks
+        self.sparks = {}
+        
+        # Plasma phase
+        self.plasma_phase = random.random() * 6.28
+        
+        # Horizontal text trails (scrolling words)
+        self.h_trails = []
+        for _ in range(5):
+            self.h_trails.append({
+                'y': random.randint(0, height - 1),
+                'x': random.randint(-30, width),
+                'word': random.choice(CYBER_WORDS),
+                'speed': random.randint(2, 6),
+                'hue': random.random()
+            })
+        
+        # Vertical text trails (falling words)
+        self.v_trails = []
+        for _ in range(5):
+            self.v_trails.append({
+                'x': random.randint(0, width - 1),
+                'y': random.randint(-20, height),
+                'word': random.choice(CYBER_WORDS),
+                'speed': random.randint(1, 4),
+                'hue': random.random()
+            })
+        
+        # Scan lines
+        self.scan_y = 0
+        self.scan_speed = 2
 
     def update(self, audio_level, audio_norm):
         self.frame_count += 1
+        self.audio_norm = audio_norm
+        self.plasma_phase += 0.08 + audio_norm * 0.15
         
         # Update Rain
         for col in self.rain_cols:
             if col['active']:
                 col['y'] += col['speed']
                 if col['y'] > self.h + col['len']:
-                    col['y'] = -random.randint(5, 20)
-                    col['active'] = random.random() < 0.3 # Randomly restart or stop
+                    col['y'] = -random.randint(3, 15)
+                    col['speed'] = random.randint(1, 5)
+                    col['hue'] = random.random()
+                    col['active'] = random.random() < 0.4
             else:
-                if random.random() < 0.01:
+                if random.random() < 0.03 + audio_norm * 0.05:
                     col['active'] = True
                     col['y'] = -col['len']
-
-        # Spawn ripples on loud audio
-        if audio_norm > 0.6 and random.random() < 0.3:
-            self.ripples.append({
-                'x': random.randint(0, self.w),
-                'y': random.randint(0, self.h),
-                'r': 0,
-                'max_r': random.randint(10, 30),
-                'life': 1.0
+        
+        # Glitch blocks on audio
+        if audio_norm > 0.3 and random.random() < 0.4:
+            bw = random.randint(3, 20)
+            bh = random.randint(2, 8)
+            self.glitch_blocks.append({
+                'x': random.randint(0, max(1, self.w - bw)),
+                'y': random.randint(0, max(1, self.h - bh)),
+                'w': bw, 'h': bh,
+                'life': random.uniform(0.3, 1.0),
+                'hue': random.random(),
+                'char': random.choice(TRIPPY_CHARS)
             })
-            
-        # Update Ripples
-        for r in self.ripples[:]:
-            r['r'] += 1.5
-            r['life'] -= 0.05
-            if r['life'] <= 0 or r['r'] > r['max_r']:
-                self.ripples.remove(r)
+        
+        for g in self.glitch_blocks[:]:
+            g['life'] -= 0.08
+            if g['life'] <= 0:
+                self.glitch_blocks.remove(g)
+        
+        # Sparks
+        num_sparks = int(3 + audio_norm * 15)
+        for _ in range(num_sparks):
+            sx = random.randint(0, self.w - 1)
+            sy = random.randint(0, self.h - 1)
+            self.sparks[(sx, sy)] = random.uniform(0.3, 1.0)
+        
+        dead = []
+        for k, v in self.sparks.items():
+            self.sparks[k] = v - 0.15
+            if self.sparks[k] <= 0:
+                dead.append(k)
+        for k in dead:
+            del self.sparks[k]
+        
+        # Update horizontal text trails
+        for ht in self.h_trails:
+            ht['x'] += ht['speed']
+            if ht['x'] > self.w + 10:
+                ht['x'] = -len(ht['word']) * 2
+                ht['y'] = random.randint(0, self.h - 1)
+                ht['word'] = random.choice(CYBER_WORDS)
+                ht['hue'] = random.random()
+        
+        # Update vertical text trails
+        for vt in self.v_trails:
+            vt['y'] += vt['speed']
+            if vt['y'] > self.h + 10:
+                vt['y'] = -len(vt['word']) * 2
+                vt['x'] = random.randint(0, self.w - 1)
+                vt['word'] = random.choice(CYBER_WORDS)
+                vt['hue'] = random.random()
+        
+        # Scan line
+        self.scan_y = (self.scan_y + self.scan_speed) % self.h
+        
+        # Spawn more trails on loud audio
+        if audio_norm > 0.5 and random.random() < 0.2:
+            self.h_trails.append({
+                'y': random.randint(0, self.h - 1),
+                'x': -10,
+                'word': random.choice(CYBER_WORDS),
+                'speed': random.randint(3, 8),
+                'hue': random.random()
+            })
+        # Cap trails
+        if len(self.h_trails) > 12:
+            self.h_trails = self.h_trails[-12:]
+        if len(self.v_trails) > 10:
+            self.v_trails = self.v_trails[-10:]
 
     def get_effect(self, x, y, brightness):
-        # 1. Matrix Rain
+        inten = BG_INTENSITY
+        
+        # 1. Scan line - bright horizontal sweep
+        if abs(y - self.scan_y) < 1:
+            hue = (self.frame_count * 0.02) % 1.0
+            r, g, b = colorsys.hsv_to_rgb(hue, 0.5, 0.8 * inten)
+            return '─', int(r*255), int(g*255), int(b*255)
+        
+        # 2. Horizontal text trails
+        for ht in self.h_trails:
+            if y == ht['y']:
+                ci = x - ht['x']
+                if 0 <= ci < len(ht['word']):
+                    char = ht['word'][ci]
+                    r, g, b = colorsys.hsv_to_rgb(ht['hue'], 0.9, 0.9 * inten)
+                    return char, int(r*255), int(g*255), int(b*255)
+        
+        # 3. Vertical text trails
+        for vt in self.v_trails:
+            if x == vt['x']:
+                ci = y - vt['y']
+                if 0 <= ci < len(vt['word']):
+                    char = vt['word'][ci]
+                    r, g, b = colorsys.hsv_to_rgb(vt['hue'], 0.9, 0.85 * inten)
+                    return char, int(r*255), int(g*255), int(b*255)
+        
+        # 4. Sparks
+        if (x, y) in self.sparks:
+            life = self.sparks[(x, y)]
+            hue = (x * 0.01 + y * 0.01 + self.frame_count * 0.1) % 1.0
+            r, g, b = colorsys.hsv_to_rgb(hue, 0.8, life * inten)
+            return random.choice(GLITCH_CHARS), int(r*255), int(g*255), int(b*255)
+        
+        # 5. Glitch blocks
+        for gb in self.glitch_blocks:
+            if gb['x'] <= x < gb['x'] + gb['w'] and gb['y'] <= y < gb['y'] + gb['h']:
+                r, g, b = colorsys.hsv_to_rgb(gb['hue'], 0.9, gb['life'] * 0.6 * inten)
+                return gb['char'], int(r*255), int(g*255), int(b*255)
+        
+        # 6. Matrix Rain
         col = self.rain_cols[x]
         if col['active']:
             dist = y - col['y']
             if 0 <= dist < col['len']:
-                norm_dist = dist / col['len'] # 0 (head) to 1 (tail)
+                norm_dist = dist / col['len']
+                intensity = 1.0 - norm_dist
+                hue = (col['hue'] + self.frame_count * 0.005) % 1.0
                 
-                # Head is bright white
                 if dist < 1:
-                    return random.choice(MATRIX_CHARS), 200, 255, 200
+                    r, g, b = colorsys.hsv_to_rgb(hue, 0.3, 0.9 * inten)
+                    return random.choice(MATRIX_CHARS), int(r*255), int(g*255), int(b*255)
                 
-                # Tail is green/fading
-                g_val = int(255 * (1.0 - norm_dist))
-                return random.choice(MATRIX_CHARS), 0, max(50, g_val), 0
+                r, g, b = colorsys.hsv_to_rgb(hue, 0.7, intensity * 0.5 * inten)
+                return random.choice(MATRIX_CHARS), int(r*255), int(g*255), int(b*255)
         
-        # 2. Ripples
-        in_ripple = False
-        ripple_strength = 0
-        for r in self.ripples:
-            d = math.sqrt((x - r['x'])**2 + (y - r['y'])**2)
-            if abs(d - r['r']) < 2.0:
-                 in_ripple = True
-                 ripple_strength = max(ripple_strength, r['life'])
-
-        if in_ripple:
-             val = int(255 * ripple_strength)
-             return random.choice(HEX_CHARS), val, int(val*0.5), 255 # Blue-ish ripple
-
-        # 3. Default Background
-        n = len(ASCII_BG)
-        idx = min(int(brightness / 255.0 * (n - 1)), n - 1)
-        char = ASCII_BG[idx]
+        # 7. Plasma base - dark with subtle color
+        t = self.plasma_phase
+        v1 = math.sin(x * 0.04 + t)
+        v2 = math.sin(y * 0.06 - t * 0.7)
+        v3 = math.sin((x * 0.03 + y * 0.04) + t * 0.5)
+        v4 = math.sin(math.sqrt(max(0.01, (x - self.w/2)**2 + (y - self.h/2)**2)) * 0.08 - t)
+        plasma = (v1 + v2 + v3 + v4) / 4.0
         
-        base = BG_BASE_COLOR
-        b_factor = brightness / 255.0
-        return char, int(base[0]*b_factor), int(base[1]*b_factor), int(base[2]*b_factor)
+        hue = ((plasma + 1.0) / 2.0 + self.frame_count * 0.008) % 1.0
+        sat = 0.6 + self.audio_norm * 0.3
+        val = (0.08 + abs(plasma) * 0.12 + self.audio_norm * 0.06) * inten
+        
+        r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
+        
+        if random.random() < 0.02 + self.audio_norm * 0.03:
+            char = random.choice(TRIPPY_CHARS)
+        else:
+            n = len(ASCII_BG)
+            idx = min(int((abs(plasma) + 0.1) * (n - 1)), n - 1)
+            char = ASCII_BG[idx]
+        
+        return char, int(r*255), int(g*255), int(b*255)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -218,12 +417,13 @@ class BodyEffects:
         
     def update(self, audio_norm):
         self.frame_count += 1
-        self.pattern_offset += 0.1 + (audio_norm * 0.2)
+        body_audio = audio_norm * AUDIO_REACT_BODY
+        self.pattern_offset += 0.1 + (body_audio * 0.2)
         
         # Switch palettes based on intensity
-        if audio_norm > 0.8:
+        if body_audio > 0.8:
             self.target_palette_name = "PLASMA"
-        elif audio_norm > 0.4:
+        elif body_audio > 0.4:
              self.target_palette_name = "CYBERPUNK"
         else:
              self.target_palette_name = "MATRIX"
@@ -231,7 +431,7 @@ class BodyEffects:
         if self.current_palette_name != self.target_palette_name:
              self.current_palette_name = self.target_palette_name
 
-    def get_color(self, x, y, brightness, w, h, frame_small, is_aura=False, blend_factor=0.5):
+    def get_color(self, x, y, brightness, w, h, pixel_rgb, is_aura=False):
         
         if is_aura:
             # Aura is electric blue/white, sparse for effect
@@ -241,42 +441,38 @@ class BodyEffects:
             
         # ─── REALISM: STRICTLY USE BRIGHTNESS FOR CHARACTER ───
         n = len(ASCII_BODY)
-        # Gamma correction for better midtones
         norm_b = brightness / 255.0
         idx = min(int(norm_b * (n - 1)), n - 1)
         char = ASCII_BODY[idx]
 
         # ─── COLOR LOGIC ───
-        # Get original color
-        b_orig, g_orig, r_orig = frame_small[y, x] # OpenCV is BGR
+        # pixel_rgb is (R, G, B) from the camera
+        r_orig, g_orig, b_orig = int(pixel_rgb[0]), int(pixel_rgb[1]), int(pixel_rgb[2])
         
-        # Circuit / Data Pattern affects COLOR only
+        # Circuit / Data Pattern for neon tint
         nx = x / w
         ny = y / h
-        
         wave = math.sin(nx * 10 + ny * 10 - self.pattern_offset) 
         wave2 = math.cos(nx * 20 - ny * 5 + self.pattern_offset * 0.5)
-        pattern = (wave + wave2) / 2.0 # -1 to 1
+        pattern = (wave + wave2) / 2.0
         
-        # Base Color from Palette
         palette = PALETTES[self.current_palette_name]
         t = (pattern + 1.0) / 2.0 
         r_neon, g_neon, b_neon = sample_gradient(palette, t)
         
-        # Blend original with neon
-        # We want the original structure but the neon vibe
-        r = int(r_orig * blend_factor + r_neon * (1 - blend_factor))
-        g = int(g_orig * blend_factor + g_neon * (1 - blend_factor))
-        b = int(b_orig * blend_factor + b_neon * (1 - blend_factor))
+        # Camera color + neon tint (uses config)
+        blend = BODY_CAMERA_BLEND
+        effect = BODY_EFFECT_BLEND
+        r = int(r_orig * blend + r_neon * effect * norm_b)
+        g = int(g_orig * blend + g_neon * effect * norm_b)
+        b = int(b_orig * blend + b_neon * effect * norm_b)
         
-        # Modulate by brightness (so dark areas stay dark)
-        # But don't double-darken too much since original color already has brightness info
-        # Let's just boost saturation/brightness slightly if needed
+        # Brightness boost for body clarity
+        boost = BODY_BRIGHTNESS_BOOST
+        r = min(255, int(r * boost))
+        g = min(255, int(g * boost))
+        b = min(255, int(b * boost))
         
-        # Highlight bright spots white
-        if brightness > 230:
-            r, g, b = 255, 255, 255
-            
         return char, r, g, b
 
 
@@ -298,9 +494,9 @@ class FaceEffects:
         if h > 0:
             self.scan_line_y = face_top + (self.frame_count * self.scan_speed) % h
 
-    def get_color(self, x, y, brightness, face_rect, audio_norm, frame_small):
+    def get_color(self, x, y, brightness, face_rect, audio_norm, pixel_rgb):
         ft, fb, fl, fr = face_rect
-        b_orig, g_orig, r_orig = frame_small[y, x]
+        r_orig, g_orig, b_orig = int(pixel_rgb[0]), int(pixel_rgb[1]), int(pixel_rgb[2])
         
         # HUD Corners
         if x == fl and y == ft: return '╔', 255, 255, 0
@@ -314,28 +510,425 @@ class FaceEffects:
         idx = min(int(norm_b * (n - 1)), n - 1)
         char = ASCII_FACE[idx]
 
-        # Base face color — cycling gold/amber
+        # Face uses camera color + subtle tint (uses config)
         t = (time.time() * 0.5)
         base_color = sample_gradient(FACE_COLORS, t)
         
-        # Blend: Mostly original natural color, tinted by the sci-fi base color
-        blend = 0.7 # 70% original, 30% tint
-        r = int(r_orig * blend + base_color[0] * (1 - blend))
-        g = int(g_orig * blend + base_color[1] * (1 - blend))
-        b = int(b_orig * blend + base_color[2] * (1 - blend))
+        blend = FACE_CAMERA_BLEND
+        effect = FACE_EFFECT_BLEND
+        r = int(r_orig * blend + base_color[0] * effect)
+        g = int(g_orig * blend + base_color[1] * effect)
+        b = int(b_orig * blend + base_color[2] * effect)
         
-        # Slight brightness boost for face to ensure it pops
-        r = min(255, int(r * 1.2))
-        g = min(255, int(g * 1.2))
-        b = min(255, int(b * 1.2))
+        # Brightness boost for face clarity (uses config)
+        boost = FACE_BRIGHTNESS_BOOST
+        r = min(255, int(r * boost))
+        g = min(255, int(g * boost))
+        b = min(255, int(b * boost))
         
-        # Glitch (Color only, keep char unless very strong)
-        if audio_norm > 0.7 and random.random() < 0.1:
-            r, g, b = 255, 255, 255 # Flash white
+        # Glitch on loud audio
+        if audio_norm * AUDIO_REACT_FACE > 0.7 and random.random() < 0.1:
+            r, g, b = 255, 255, 255
             if random.random() < 0.5:
                 char = random.choice(MATRIX_CHARS)
 
         return char, r, g, b
+
+
+# ═══════════════════════════════════════════════════════════════
+#  FACE MOTION TRAIL
+# ═══════════════════════════════════════════════════════════════
+
+class FaceTrail:
+    """Leaves bright, long-lasting trippy neon light trails when the face moves."""
+    
+    TRAIL_BRIGHT_CHARS = list('█▓▒░★✦⚡●◆♦♢✧')
+    TRAIL_FADE_CHARS = list('▒░·•✧○◇')
+    TRAIL_DIM_CHARS = list('·.,:;')
+    
+    def __init__(self):
+        self.trail = {}  # (x, y) -> {'life': float, 'hue': float, 'birth_hue': float}
+        self.prev_center = None
+        self.frame_count = 0
+        self.trail_hue = 0.0
+    
+    def update(self, face_rect, has_face):
+        self.frame_count += 1
+        self.trail_hue = (self.trail_hue + 0.025) % 1.0
+        
+        if has_face:
+            ft, fb, fl, fr = face_rect
+            cx = (fl + fr) // 2
+            cy = (ft + fb) // 2
+            fw = max(fr - fl, 1)
+            fh = max(fb - ft, 1)
+            
+            if self.prev_center is not None:
+                px, py = self.prev_center
+                dx = abs(cx - px)
+                dy = abs(cy - py)
+                
+                # Only trail if face is moving enough
+                if dx > 1 or dy > 1:
+                    speed = math.sqrt(dx**2 + dy**2)
+                    trail_life = min(1.0, 0.7 + speed * 0.05)  # Faster = brighter start
+                    
+                    # Deposit trail pixels along the face boundary — 2 pixels wide
+                    for i in range(0, max(fw, fh), 1):  # Every pixel, not every 2
+                        # Top and bottom edges (2 pixels thick)
+                        tx = fl + (i % fw)
+                        for offset in range(2):
+                            self.trail[(tx, ft + offset)] = {'life': trail_life, 'hue': self.trail_hue}
+                            self.trail[(tx, fb - offset)] = {'life': trail_life, 'hue': (self.trail_hue + 0.3) % 1.0}
+                        # Left and right edges (2 pixels thick)
+                        ty = ft + (i % fh)
+                        for offset in range(2):
+                            self.trail[(fl + offset, ty)] = {'life': trail_life, 'hue': (self.trail_hue + 0.5) % 1.0}
+                            self.trail[(fr - offset, ty)] = {'life': trail_life, 'hue': (self.trail_hue + 0.7) % 1.0}
+                    
+                    # Interpolate between prev and current position for smooth trails
+                    steps = max(int(speed), 2)
+                    for s in range(steps):
+                        t = s / steps
+                        ix = int(px + (cx - px) * t)
+                        iy = int(py + (cy - py) * t)
+                        # Deposit a small glow around interpolated points
+                        for ox in range(-2, 3):
+                            for oy in range(-1, 2):
+                                self.trail[(ix + ox, iy + oy)] = {
+                                    'life': trail_life * 0.8,
+                                    'hue': (self.trail_hue + t * 0.5) % 1.0
+                                }
+                    
+                    # Scatter bright sparkles behind the face — more particles
+                    num_sparkles = 20 + int(speed * 3)
+                    for _ in range(num_sparkles):
+                        # Sparkles trail BEHIND the direction of motion
+                        sx = px + random.randint(-fw//2 - 3, fw//2 + 3)
+                        sy = py + random.randint(-fh//2 - 2, fh//2 + 2)
+                        self.trail[(sx, sy)] = {
+                            'life': random.uniform(0.6, 1.0),
+                            'hue': (self.trail_hue + random.uniform(-0.2, 0.2)) % 1.0
+                        }
+            
+            self.prev_center = (cx, cy)
+        
+        # Decay all trail pixels — SLOWER decay for longer trails
+        dead = []
+        for k, v in self.trail.items():
+            v['life'] -= 0.025  # Was 0.06 — now 2.4× slower decay
+            if v['life'] <= 0:
+                dead.append(k)
+        for k in dead:
+            del self.trail[k]
+        
+        # Cap max trail entries to prevent performance issues
+        if len(self.trail) > 8000:
+            # Remove oldest (lowest life) entries
+            sorted_trails = sorted(self.trail.items(), key=lambda x: x[1]['life'])
+            for k, _ in sorted_trails[:2000]:
+                del self.trail[k]
+    
+    def get_trail(self, x, y):
+        """Returns (has_trail, char, r, g, b) for this pixel."""
+        if (x, y) in self.trail:
+            t = self.trail[(x, y)]
+            # Brightness boost — trails stay bright longer
+            vis_life = min(1.0, t['life'] * 1.8)
+            r, g, b = colorsys.hsv_to_rgb(t['hue'], 1.0, vis_life)  # Full saturation
+            
+            # Choose character based on life remaining
+            if t['life'] > 0.6:
+                char = random.choice(self.TRAIL_BRIGHT_CHARS)
+            elif t['life'] > 0.3:
+                char = random.choice(self.TRAIL_FADE_CHARS)
+            else:
+                char = random.choice(self.TRAIL_DIM_CHARS)
+            
+            return True, char, int(r * 255), int(g * 255), int(b * 255)
+        return False, ' ', 0, 0, 0
+
+
+# ═══════════════════════════════════════════════════════════════
+#  BODY MOTION TRAIL
+# ═══════════════════════════════════════════════════════════════
+
+class BodyTrail:
+    """Leaves neon trails when the body moves — less intense than face trails."""
+    
+    TRAIL_BRIGHT_CHARS = list('▓▒░✦●◆♦')
+    TRAIL_FADE_CHARS = list('░·•○◇')
+    TRAIL_DIM_CHARS = list('·.:')
+    
+    def __init__(self):
+        self.trail = {}  # (x, y) -> {'life': float, 'hue': float}
+        self.prev_centroid = None
+        self.frame_count = 0
+        self.trail_hue = 0.0
+    
+    def update(self, body_mask, is_body):
+        """Update body trail based on body mask centroid movement."""
+        self.frame_count += 1
+        self.trail_hue = (self.trail_hue + 0.015) % 1.0  # Slower hue cycle than face
+        
+        # Find body centroid from mask
+        ys, xs = np.where(is_body)
+        has_body = len(xs) > 20  # Need minimum body pixels
+        
+        if has_body:
+            cx = int(np.mean(xs))
+            cy = int(np.mean(ys))
+            
+            # Get body bounding box
+            bx_min, bx_max = int(np.min(xs)), int(np.max(xs))
+            by_min, by_max = int(np.min(ys)), int(np.max(ys))
+            bw = max(bx_max - bx_min, 1)
+            bh = max(by_max - by_min, 1)
+            
+            if self.prev_centroid is not None:
+                px, py = self.prev_centroid
+                dx = abs(cx - px)
+                dy = abs(cy - py)
+                
+                # Only trail if body is actually moving
+                if dx > 2 or dy > 2:
+                    speed = math.sqrt(dx**2 + dy**2)
+                    trail_life = min(0.85, 0.5 + speed * 0.03)  # Dimmer start than face
+                    
+                    # Sample edge pixels from the body boundary
+                    # Use a stride to keep it performant
+                    h, w = body_mask.shape
+                    stride = max(3, bh // 15)
+                    
+                    for row in range(by_min, by_max, stride):
+                        row_pixels = np.where(is_body[row, :])[0]
+                        if len(row_pixels) > 0:
+                            # Left and right edges of body at this row
+                            left_edge = int(row_pixels[0])
+                            right_edge = int(row_pixels[-1])
+                            self.trail[(left_edge, row)] = {
+                                'life': trail_life,
+                                'hue': (self.trail_hue + row * 0.005) % 1.0
+                            }
+                            self.trail[(right_edge, row)] = {
+                                'life': trail_life,
+                                'hue': (self.trail_hue + 0.4 + row * 0.005) % 1.0
+                            }
+                    
+                    # Top and bottom edges
+                    for col in range(bx_min, bx_max, stride):
+                        col_pixels = np.where(is_body[:, col])[0]
+                        if len(col_pixels) > 0:
+                            top_edge = int(col_pixels[0])
+                            bot_edge = int(col_pixels[-1])
+                            self.trail[(col, top_edge)] = {
+                                'life': trail_life,
+                                'hue': (self.trail_hue + 0.2) % 1.0
+                            }
+                            self.trail[(col, bot_edge)] = {
+                                'life': trail_life,
+                                'hue': (self.trail_hue + 0.6) % 1.0
+                            }
+                    
+                    # Scatter sparkles — fewer than face
+                    num_sparkles = 10 + int(speed * 1.5)
+                    for _ in range(num_sparkles):
+                        sx = px + random.randint(-bw//4, bw//4)
+                        sy = py + random.randint(-bh//4, bh//4)
+                        self.trail[(sx, sy)] = {
+                            'life': random.uniform(0.4, 0.75),
+                            'hue': (self.trail_hue + random.uniform(-0.15, 0.15)) % 1.0
+                        }
+            
+            self.prev_centroid = (cx, cy)
+        
+        # Decay — faster than face trails for subtler effect
+        dead = []
+        for k, v in self.trail.items():
+            v['life'] -= 0.035  # Faster decay than face (0.025)
+            if v['life'] <= 0:
+                dead.append(k)
+        for k in dead:
+            del self.trail[k]
+        
+        # Cap trail entries
+        if len(self.trail) > 5000:
+            sorted_trails = sorted(self.trail.items(), key=lambda x: x[1]['life'])
+            for k, _ in sorted_trails[:1500]:
+                del self.trail[k]
+    
+    def get_trail(self, x, y):
+        """Returns (has_trail, char, r, g, b) for this pixel."""
+        if (x, y) in self.trail:
+            t = self.trail[(x, y)]
+            # Less bright than face trails
+            vis_life = min(1.0, t['life'] * 1.4)  # 1.4x vs face's 1.8x
+            r, g, b = colorsys.hsv_to_rgb(t['hue'], 0.85, vis_life)  # Lower sat than face
+            
+            if t['life'] > 0.5:
+                char = random.choice(self.TRAIL_BRIGHT_CHARS)
+            elif t['life'] > 0.25:
+                char = random.choice(self.TRAIL_FADE_CHARS)
+            else:
+                char = random.choice(self.TRAIL_DIM_CHARS)
+            
+            return True, char, int(r * 255), int(g * 255), int(b * 255)
+        return False, ' ', 0, 0, 0
+
+
+# ═══════════════════════════════════════════════════════════════
+#  MUSIC-REACTIVE PSYCHEDELIC DISTORTION 
+# ═══════════════════════════════════════════════════════════════
+
+class MusicDistortion:
+    """Creates psychedelic rainbow heat-map / flowing neon liquid distortions
+    driven by audio levels. Inspired by thermal-vision rainbow overlays 
+    and organic cyan/magenta flowing patterns."""
+    
+    def __init__(self):
+        self.frame_count = 0
+        self.phase = 0.0
+        self.beat_flash = 0.0
+        self.prev_audio = 0.0
+        self.beat_accumulator = 0.0
+        self.flow_offset_x = 0.0
+        self.flow_offset_y = 0.0
+        # Smooth audio for less jittery response
+        self.smooth_audio = 0.0
+    
+    def update(self, audio_norm):
+        self.frame_count += 1
+        # Smooth the audio signal to prevent jitter
+        self.smooth_audio = self.smooth_audio * 0.7 + audio_norm * 0.3
+        
+        # Phase advances faster with louder music
+        self.phase += 0.05 + self.smooth_audio * 0.2
+        
+        # Beat detection — sudden volume increases
+        audio_delta = audio_norm - self.prev_audio
+        if audio_delta > 0.15:
+            self.beat_flash = min(1.0, self.beat_flash + audio_delta * 2.0)
+            self.beat_accumulator += 1.0
+        self.beat_flash *= 0.85  # Decay beat flash
+        self.prev_audio = audio_norm
+        
+        # Flow movement — organic drifting
+        self.flow_offset_x += 0.03 + self.smooth_audio * 0.1
+        self.flow_offset_y += 0.02 + self.smooth_audio * 0.08
+    
+    def get_body_distortion(self, x, y, w, h, pixel_rgb, brightness):
+        """Rainbow heat-map distortion over the body — like thermal/psychedelic vision.
+        Returns (r, g, b) with rainbow overlay blended based on audio."""
+        audio = self.smooth_audio
+        if audio < 0.05:
+            return int(pixel_rgb[0]), int(pixel_rgb[1]), int(pixel_rgb[2])
+        
+        strength = audio * MUSIC_DISTORTION_STRENGTH * AUDIO_REACT_BODY
+        
+        # Multi-frequency sine waves for rainbow heat-map effect
+        nx = x / max(w, 1)
+        ny = y / max(h, 1)
+        
+        # Create flowing rainbow pattern (like thermal vision from Image 1)
+        wave1 = math.sin(nx * 8.0 + self.phase * 1.3)
+        wave2 = math.sin(ny * 6.0 - self.phase * 0.9)
+        wave3 = math.sin((nx + ny) * 5.0 + self.phase * 1.1)
+        wave4 = math.sin(math.sqrt(max(0.01, (nx - 0.5)**2 + (ny - 0.5)**2)) * 12.0 - self.phase * 1.5)
+        
+        # Combine waves — creates complex flowing rainbow
+        combined = (wave1 + wave2 + wave3 + wave4) / 4.0
+        
+        # Map to full rainbow hue — this creates the psychedelic rainbow heat-map
+        hue = (combined * 0.5 + 0.5 + self.frame_count * 0.01) % 1.0
+        
+        # Brightness follows original image brightness for "heat-map" look
+        norm_b = brightness / 255.0
+        val = 0.5 + norm_b * 0.5
+        
+        # Saturation high for vivid rainbow
+        sat = 0.85 + self.beat_flash * 0.15
+        
+        r_dist, g_dist, b_dist = colorsys.hsv_to_rgb(hue, sat, val)
+        r_dist = int(r_dist * 255)
+        g_dist = int(g_dist * 255)
+        b_dist = int(b_dist * 255)
+        
+        # Blend: original camera + rainbow distortion based on audio strength
+        r_orig, g_orig, b_orig = int(pixel_rgb[0]), int(pixel_rgb[1]), int(pixel_rgb[2])
+        r = int(r_orig * (1 - strength) + r_dist * strength)
+        g = int(g_orig * (1 - strength) + g_dist * strength)
+        b = int(b_orig * (1 - strength) + b_dist * strength)
+        
+        # Beat flash — white burst on beats
+        if self.beat_flash > 0.3:
+            flash = self.beat_flash * 0.4
+            r = min(255, int(r + 255 * flash * strength))
+            g = min(255, int(g + 255 * flash * strength))
+            b = min(255, int(b + 255 * flash * strength))
+        
+        return min(255, r), min(255, g), min(255, b)
+    
+    def get_bg_flow(self, x, y, w, h):
+        """Flowing neon liquid patterns for background — cyan/magenta organic shapes.
+        Returns (r, g, b) intensity to add to background. Like Image 2."""
+        audio = self.smooth_audio
+        if audio < 0.03:
+            return 0, 0, 0
+        
+        strength = audio * MUSIC_BG_FLOW_STRENGTH
+        
+        nx = x / max(w, 1)
+        ny = y / max(h, 1)
+        
+        # Organic flowing pattern — multiple overlapping sine waves
+        # This creates the liquid/blob effect from Image 2
+        flow1 = math.sin(nx * 6.0 + self.flow_offset_x + math.sin(ny * 3.0 + self.flow_offset_y) * 2.0)
+        flow2 = math.sin(ny * 7.0 - self.flow_offset_y * 1.3 + math.sin(nx * 4.0 - self.flow_offset_x) * 1.5)
+        flow3 = math.sin((nx * 3.0 + ny * 4.0) + self.flow_offset_x * 0.7)
+        flow4 = math.cos(nx * 5.0 - ny * 3.0 + self.flow_offset_y * 0.9)
+        
+        # Combine into organic blob shape
+        blob = (flow1 + flow2 + flow3 + flow4) / 4.0
+        
+        # Create two-tone effect: cyan and magenta (like Image 2)
+        # blob ranges -1 to 1, map to color choice
+        if blob > 0.0:
+            # Cyan channel — bright neon cyan
+            intensity = blob * strength
+            r = int(0 * intensity * 255)
+            g = int(0.9 * intensity * 255)
+            b = int(1.0 * intensity * 255)
+        else:
+            # Magenta channel — vivid magenta/pink
+            intensity = abs(blob) * strength
+            r = int(1.0 * intensity * 255)
+            g = int(0.0 * intensity * 255)
+            b = int(0.8 * intensity * 255)
+        
+        # Beat pulse — expand intensity on beats
+        if self.beat_flash > 0.2:
+            mult = 1.0 + self.beat_flash * 0.8
+            r = int(r * mult)
+            g = int(g * mult)
+            b = int(b * mult)
+        
+        return min(255, r), min(255, g), min(255, b)
+    
+    def get_face_glow(self, x, y, w, h, audio_norm):
+        """Very subtle rainbow edge glow for face on loud beats.
+        Returns (r_add, g_add, b_add) to add to face color."""
+        if audio_norm < 0.4 or self.beat_flash < 0.2:
+            return 0, 0, 0
+        
+        strength = audio_norm * AUDIO_REACT_FACE * self.beat_flash
+        
+        nx = x / max(w, 1)
+        ny = y / max(h, 1)
+        
+        hue = (nx * 2.0 + ny * 2.0 + self.phase * 0.5) % 1.0
+        r, g, b = colorsys.hsv_to_rgb(hue, 0.8, strength * 0.3)
+        
+        return int(r * 255), int(g * 255), int(b * 255)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -345,13 +938,48 @@ class FaceEffects:
 def main():
     # ── Setup Audio ──
     p = pyaudio.PyAudio()
+    audio_streams = []
+    
     try:
-        stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE,
-                        input=True, frames_per_buffer=CHUNK)
+        if AUDIO_SOURCE in ("mic", "both"):
+            mic_stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE,
+                                input=True, frames_per_buffer=CHUNK)
+            audio_streams.append(mic_stream)
+            print("✓ Microphone audio stream opened.")
+        
+        if AUDIO_SOURCE in ("system", "both"):
+            monitor_idx, monitor_name = find_monitor_device(p)
+            if monitor_idx is not None:
+                sys_stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE,
+                                    input=True, input_device_index=monitor_idx,
+                                    frames_per_buffer=CHUNK)
+                audio_streams.append(sys_stream)
+                print(f"✓ System audio stream opened: {monitor_name}")
+            else:
+                print("⚠ No monitor device found! Falling back to microphone.")
+                print("  Tip: On PulseAudio, ensure a monitor source exists.")
+                print("  Available input devices:")
+                for i in range(p.get_device_count()):
+                    try:
+                        info = p.get_device_info_by_index(i)
+                        if info.get('maxInputChannels', 0) > 0:
+                            print(f"    [{i}] {info['name']}")
+                    except Exception:
+                        pass
+                mic_stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE,
+                                    input=True, frames_per_buffer=CHUNK)
+                audio_streams.append(mic_stream)
+        
+        if not audio_streams:
+            print("Error: No audio streams could be opened.")
+            return
+            
     except Exception as e:
         print(f"Error opening audio: {e}")
         return
 
+    # Start threaded audio capture (prevents render flicker)
+    audio_capture = AudioCapture(audio_streams)
     # ── Setup Video ──
     cap = cv2.VideoCapture(CAMERA_SOURCE)
     if not cap.isOpened():
@@ -359,15 +987,31 @@ def main():
         return
 
     # ── Setup MediaPipe Tasks ──
+    # Resolve model paths relative to this script's directory
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+    SEG_MODEL = os.path.join(SCRIPT_DIR, "selfie_segmenter.tflite")
+    FACE_MODEL = os.path.join(SCRIPT_DIR, "face_landmarker.task")
+    
+    # Auto-download models if missing
+    import urllib.request
+    MODELS = {
+        SEG_MODEL: "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite",
+        FACE_MODEL: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+    }
+    for path, url in MODELS.items():
+        if not os.path.exists(path):
+            print(f"Downloading {os.path.basename(path)}...")
+            urllib.request.urlretrieve(url, path)
+            print(f"  ✓ Saved to {path}")
     
     # 1. Selfie Segmentation
-    seg_base = python.BaseOptions(model_asset_path="selfie_segmenter.tflite")
+    seg_base = python.BaseOptions(model_asset_path=SEG_MODEL)
     seg_opts = vision.ImageSegmenterOptions(base_options=seg_base,
                                             output_category_mask=True)
     segmenter = vision.ImageSegmenter.create_from_options(seg_opts)
 
     # 2. Face Landmark Detection
-    mesh_base = python.BaseOptions(model_asset_path="face_landmarker.task")
+    mesh_base = python.BaseOptions(model_asset_path=FACE_MODEL)
     mesh_opts = vision.FaceLandmarkerOptions(base_options=mesh_base,
                                              num_faces=1,
                                              min_face_detection_confidence=0.5,
@@ -384,9 +1028,12 @@ def main():
     scifi_bg = None
     body_fx = BodyEffects()
     face_fx = FaceEffects()
+    face_trail = FaceTrail()
+    body_trail = BodyTrail()
+    music_dist = MusicDistortion()
     
     # ─── Frame Rate Control ───
-    fps_limit = 60
+    fps_limit = 30
     prev_time = 0
     
     print("Starting Sci-Fi ASCII Camera (Tasks API)... Press Ctrl+C to stop.")
@@ -400,8 +1047,8 @@ def main():
                  continue
             prev_time = time.time()
 
-            # ── AUDIO ──
-            vol = get_audio_level(stream)
+            # ── AUDIO (non-blocking, from background thread) ──
+            vol = audio_capture.get_volume()
             audio_norm = min(vol / 5000.0, 1.0)  # 0..1 normalized
             reactivity = int(vol / 50)
 
@@ -418,29 +1065,34 @@ def main():
             # Create MP Image
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
 
-            # ── Compute ASCII dimensions ──
-            h_orig, w_orig = gray.shape
-            aspect = w_orig / h_orig
-            new_h = int(WIDTH / aspect / 0.55)
+            # ── Compute ASCII dimensions (auto-fill terminal) ──
+            term_cols, term_rows = shutil.get_terminal_size((WIDTH, 50))
+            if AUTO_FULLSCREEN:
+                ascii_w = term_cols
+                ascii_h = term_rows - 1  # -1 to avoid scrolling
+            else:
+                h_orig, w_orig = gray.shape
+                aspect = w_orig / h_orig
+                ascii_w = WIDTH
+                ascii_h = int(WIDTH / aspect / 0.55)
 
             # ── SEGMENTATION (Tasks API) ──
             seg_result = segmenter.segment(mp_image)
             category_mask = seg_result.category_mask.numpy_view() # uint8, 255 or 0 usually check docs
             
             # Resize mask to ASCII dimensions
-            # category_mask is usually same size as input image
-            seg_mask_resized = cv2.resize(category_mask, (WIDTH, new_h), interpolation=cv2.INTER_NEAREST)
+            seg_mask_resized = cv2.resize(category_mask, (ascii_w, ascii_h), interpolation=cv2.INTER_NEAREST)
             
-            # Masks - Check index (0=background, 1=person for selfie segmenter usually, or vice versa)
-            # Standard selfie segmenter: index 1 is body. 
-            body_mask = seg_mask_resized > 0 
+            # MediaPipe selfie segmenter: 0 = person, >0 = background
+            body_mask = seg_mask_resized == 0
             
             # Create strict boolean masks
-            aura_body_mask = seg_mask_resized > 0
+            aura_body_mask = seg_mask_resized == 0
             
             # Simple erosion for "inner body" vs "aura"
             kernel = np.ones((3,3), np.uint8)
-            eroded_body = cv2.erode(seg_mask_resized, kernel, iterations=1)
+            body_uint8 = (body_mask.astype(np.uint8)) * 255
+            eroded_body = cv2.erode(body_uint8, kernel, iterations=1)
             
             is_body = eroded_body > 0
             is_aura = (aura_body_mask) & (~is_body)
@@ -451,77 +1103,123 @@ def main():
             face_top, face_bottom, face_left, face_right = 0, 0, 0, 0
             has_face = False
 
+            face_mask = np.zeros((ascii_h, ascii_w), dtype=np.uint8)
             if face_result.face_landmarks:
-                landmarks = face_result.face_landmarks[0] # List of NormalizedLandmark
+                landmarks = face_result.face_landmarks[0]
                 xs = [lm.x for lm in landmarks]
                 ys = [lm.y for lm in landmarks]
                 
-                face_left = int(min(xs) * WIDTH)
-                face_right = int(max(xs) * WIDTH)
-                face_top = int(min(ys) * new_h)
-                face_bottom = int(max(ys) * new_h)
+                face_left = int(min(xs) * ascii_w)
+                face_right = int(max(xs) * ascii_w)
+                face_top = int(min(ys) * ascii_h)
+                face_bottom = int(max(ys) * ascii_h)
                 
                 # Padding
-                pad_x = int((face_right - face_left) * 0.2)
-                pad_y = int((face_bottom - face_top) * 0.2)
+                pad_x = int((face_right - face_left) * 0.15)
+                pad_y = int((face_bottom - face_top) * 0.15)
                 face_left = max(0, face_left - pad_x)
-                face_right = min(WIDTH - 1, face_right + pad_x)
+                face_right = min(ascii_w - 1, face_right + pad_x)
                 face_top = max(0, face_top - pad_y)
-                face_bottom = min(new_h - 1, face_bottom + pad_y)
+                face_bottom = min(ascii_h - 1, face_bottom + pad_y)
+                
+                face_mask[face_top:face_bottom + 1, face_left:face_right + 1] = 255
                 has_face = True
 
-            face_mask = np.zeros((new_h, WIDTH), dtype=bool)
-            if has_face:
-                face_mask[face_top:face_bottom + 1, face_left:face_right + 1] = True
-                face_mask = face_mask & is_body
+            face_mask = face_mask > 0  # Convert to boolean
 
             # ── Resize grayscale ──
-            gray_resized = cv2.resize(gray, (WIDTH, new_h))
+            gray_resized = cv2.resize(gray, (ascii_w, ascii_h))
             
             # ── Contrast Enhancement (CLAHE) ──
-            # This brings out facial features significantly
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
             gray_enhanced = clahe.apply(gray_resized)
             
             # Audio boost
-            gray_boosted = np.clip(gray_enhanced.astype(int) + reactivity * 2, 0, 255).astype(np.uint8)
+            gray_boosted = np.clip(gray_enhanced.astype(int) + int(reactivity * 2 * AUDIO_REACT_BODY), 0, 255).astype(np.uint8)
             
-            # Resize color frame for sampling
-            frame_small = cv2.resize(frame_rgb, (WIDTH, new_h))
+            # Resize color frame for sampling (RGB format)
+            frame_small_rgb = cv2.resize(frame_rgb, (ascii_w, ascii_h))
 
             # ── Initialize/Update Effects ──
-            if scifi_bg is None or scifi_bg.w != WIDTH or scifi_bg.h != new_h:
-                scifi_bg = SciFiBackground(WIDTH, new_h)
+            if scifi_bg is None or scifi_bg.w != ascii_w or scifi_bg.h != ascii_h:
+                scifi_bg = SciFiBackground(ascii_w, ascii_h)
 
             scifi_bg.update(vol, audio_norm)
             body_fx.update(audio_norm)
+            music_dist.update(audio_norm)
+            face_rect = (face_top, face_bottom, face_left, face_right)
             if has_face:
                 face_fx.update(face_top, face_bottom)
+            face_trail.update(face_rect, has_face)
+            body_trail.update(body_mask, is_body)
 
             # ── RENDER ──
             output_lines = []
-            face_rect = (face_top, face_bottom, face_left, face_right)
 
-            for y in range(new_h):
+            for y in range(ascii_h):
                 line_chars = []
-                for x in range(WIDTH):
+                for x in range(ascii_w):
                     brightness = int(gray_boosted[y, x])
+                    pixel_rgb = frame_small_rgb[y, x]  # (R, G, B) tuple
+
+                    # Check face trail first (overlays everything)
+                    has_trail, trail_char, trail_r, trail_g, trail_b = face_trail.get_trail(x, y)
+                    # Check body trail
+                    has_btrail, btrail_char, btrail_r, btrail_g, btrail_b = body_trail.get_trail(x, y)
 
                     if face_mask[y, x]:
-                        # FACE
-                        char, r, g, b = face_fx.get_color(x, y, brightness, face_rect, audio_norm, frame_small)
+                        # FACE — bright and crisp + subtle music glow
+                        char, r, g, b = face_fx.get_color(x, y, brightness, face_rect, audio_norm, pixel_rgb)
+                        # Add subtle rainbow glow on beats
+                        gr, gg, gb = music_dist.get_face_glow(x, y, ascii_w, ascii_h, audio_norm)
+                        r = min(255, r + gr)
+                        g = min(255, g + gg)
+                        b = min(255, b + gb)
+                    
+                    elif has_trail and not is_body[y, x]:
+                        # FACE TRAIL — trippy neon sparkles
+                        char, r, g, b = trail_char, trail_r, trail_g, trail_b
                     
                     elif is_body[y, x]:
-                        # BODY
-                        char, r, g, b = body_fx.get_color(x, y, brightness, WIDTH, new_h, frame_small, is_aura=False)
+                        # BODY — real color + neon tint + MUSIC RAINBOW DISTORTION
+                        char, r, g, b = body_fx.get_color(x, y, brightness, ascii_w, ascii_h, pixel_rgb, is_aura=False)
+                        # Apply psychedelic rainbow heat-map from music
+                        dr, dg, db = music_dist.get_body_distortion(x, y, ascii_w, ascii_h, pixel_rgb, brightness)
+                        # Blend body effect with music distortion
+                        music_blend = min(1.0, audio_norm * AUDIO_REACT_BODY)
+                        r = int(r * (1 - music_blend) + dr * music_blend)
+                        g = int(g * (1 - music_blend) + dg * music_blend)
+                        b = int(b * (1 - music_blend) + db * music_blend)
                         
                     elif is_aura[y, x]:
-                        # AURA
-                        char, r, g, b = body_fx.get_color(x, y, brightness, WIDTH, new_h, frame_small, is_aura=True)
+                        # AURA — also gets music distortion
+                        char, r, g, b = body_fx.get_color(x, y, brightness, ascii_w, ascii_h, pixel_rgb, is_aura=True)
+                        dr, dg, db = music_dist.get_body_distortion(x, y, ascii_w, ascii_h, pixel_rgb, brightness)
+                        music_blend = min(1.0, audio_norm * AUDIO_REACT_BODY * 0.5)
+                        r = int(r * (1 - music_blend) + dr * music_blend)
+                        g = int(g * (1 - music_blend) + dg * music_blend)
+                        b = int(b * (1 - music_blend) + db * music_blend)
                         
                     else:
-                        # BACKGROUND
-                        char, r, g, b = scifi_bg.get_effect(x, y, brightness)
+                        # BACKGROUND — full trippy mode + FLOWING NEON MUSIC PATTERNS
+                        # Check body trail first — shows where body WAS
+                        if has_btrail:
+                            char, r, g, b = btrail_char, btrail_r, btrail_g, btrail_b
+                        elif has_trail:
+                            # Face trail in background
+                            char, r, g, b = trail_char, trail_r, trail_g, trail_b
+                        else:
+                            bg_char, bg_r, bg_g, bg_b = scifi_bg.get_effect(x, y, brightness)
+                            r_cam, g_cam, b_cam = int(pixel_rgb[0]), int(pixel_rgb[1]), int(pixel_rgb[2])
+                            r = int(r_cam * BG_CAMERA_BLEND + bg_r * BG_EFFECT_BLEND)
+                            g = int(g_cam * BG_CAMERA_BLEND + bg_g * BG_EFFECT_BLEND)
+                            b = int(b_cam * BG_CAMERA_BLEND + bg_b * BG_EFFECT_BLEND)
+                            char = bg_char
+                            # Add flowing neon music patterns (cyan/magenta)
+                            fr, fg, fb = music_dist.get_bg_flow(x, y, ascii_w, ascii_h)
+                            r = min(255, r + fr)
+                            g = min(255, g + fg)
+                            b = min(255, b + fb)
 
                     line_chars.append(f"\033[38;2;{r};{g};{b}m{char}")
 
@@ -546,8 +1244,10 @@ def main():
     segmenter.close()
     face_landmarker.close()
     cap.release()
-    stream.stop_stream()
-    stream.close()
+    audio_capture.stop()
+    for s in audio_streams:
+        s.stop_stream()
+        s.close()
     p.terminate()
 
 
